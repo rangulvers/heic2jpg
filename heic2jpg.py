@@ -7,6 +7,7 @@ from loguru import logger
 from tqdm import tqdm
 import pyheif
 import piexif
+import time
 
 app = typer.Typer(add_completion=False)
 
@@ -78,12 +79,18 @@ def main(
     output_dir: str = typer.Option(None, "--output-dir", "-o", help="Directory to save converted JPEG files"),
     overwrite: bool = typer.Option(False, "--overwrite", "-w", help="Overwrite existing JPEG files"),
     delete_original: bool = typer.Option(False, "--delete-original", "-d", help="Delete original HEIC files after conversion"),
+    threads: int = typer.Option(MAX_THREADS, "--threads", "-t", help="Number of threads to use for conversion"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose output"),
 ):
     """
     Converts all HEIC files in a directory (recursively) to JPEG format.
     """
     setup_logging(verbose)
+    
+    if threads:
+        global MAX_THREADS
+        MAX_THREADS = threads
+    
 
     start_time = time.time()
     logger.info(f"Conversion process started for directory: {directory}")
@@ -145,4 +152,4 @@ def main(
     logger.info(f"Conversion process completed in {total_time:.2f} seconds.")
 
 if __name__ == "__main__":
-    main()
+    app()
