@@ -11,7 +11,7 @@ import time
 
 app = typer.Typer(add_completion=False)
 
-MAX_THREADS = 4
+MAX_THREADS = 6
 
 def find_heic_files(directory):
     heic_files = []
