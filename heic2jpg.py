@@ -1,55 +1,32 @@
 import os
-import pyheif
+import sys
+import concurrent.futures
 from PIL import Image
 import typer
-import concurrent.futures
-import threading  # For thread-safe counters
-import time
 from loguru import logger
+from tqdm import tqdm
+import pyheif
 import piexif
-import sys  # For stdout manipulation
 
 app = typer.Typer(add_completion=False)
 
-# Limit the maximum number of threads to avoid overloading the NAS
 MAX_THREADS = 4
 
-# Default sleep interval to reduce the load on the NAS during directory traversal
-SLEEP_INTERVAL = 0.01
-
-# Thread-safe counters
-file_search_counter = 0
-converted_files_counter = 0
-converted_files_lock = threading.Lock()  # For thread-safe increments
-
-def find_heic_files(directory, sleep_interval=SLEEP_INTERVAL):
+def find_heic_files(directory):
     heic_files = []
-    global file_search_counter
     logger.info(f"Starting to scan for HEIC files in directory: {directory}")
-    start_time = time.time()
-    last_update_time = start_time
     for root, _, files in os.walk(directory):
         for file in files:
-            if file.lower().endswith(".heic"):
+            if file.lower().endswith((".heic", ".heif")):
                 heic_file_path = os.path.join(root, file)
                 heic_files.append(heic_file_path)
-                file_search_counter += 1
-                current_time = time.time()
-                # Update the count every 0.5 seconds
-                if current_time - last_update_time >= 0.5:
-                    print(f"\rHEIC files found so far: {file_search_counter}", end='', flush=True)
-                    last_update_time = current_time
-            time.sleep(sleep_interval)  # Adding a slight delay to reduce NAS load
-    # Final count display
-    print(f"\rTotal HEIC files found: {file_search_counter}")
     logger.info(f"Finished scanning. Total HEIC files found: {len(heic_files)}")
     return heic_files
 
 def convert_heic_to_jpg(heic_path, jpg_path, overwrite=False, delete_original=False):
-    global converted_files_counter
     if not overwrite and os.path.exists(jpg_path):
         logger.debug(f"JPEG already exists for {heic_path}, skipping conversion.")
-        return
+        return True  # Indicate that the file was "processed"
     try:
         heif_file = pyheif.read(heic_path)
         image = Image.frombytes(
@@ -62,7 +39,7 @@ def convert_heic_to_jpg(heic_path, jpg_path, overwrite=False, delete_original=Fa
             if metadata['type'] == 'Exif':
                 exif_dict = piexif.load(metadata['data'])
                 break
-        exif_bytes = piexif.dump(exif_dict)
+        exif_bytes = piexif.dump(exif_dict) if exif_dict else None
 
         image.save(jpg_path, "JPEG", exif=exif_bytes)
         logger.debug(f"Successfully converted {heic_path} to {jpg_path}")
@@ -71,17 +48,29 @@ def convert_heic_to_jpg(heic_path, jpg_path, overwrite=False, delete_original=Fa
             os.remove(heic_path)
             logger.debug(f"Deleted original HEIC file: {heic_path}")
 
-        # Update the converted files counter in a thread-safe manner
-        with converted_files_lock:
-            converted_files_counter += 1
-            print(f"\rFiles converted: {converted_files_counter}/{file_search_counter}", end='', flush=True)
+        return True  # Indicate success
 
-    except pyheif.error.HeifError as e:
-        logger.error(f"HEIF error for {heic_path}: {e}")
-    except OSError as e:
-        logger.error(f"OS error for {heic_path}: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error during conversion of {heic_path}: {e}")
+        logger.error(f"Error converting {heic_path}: {e}", exc_info=True)
+        return False  # Indicate failure
+
+def setup_logging(verbose: bool):
+    logger.remove()
+    level = "DEBUG" if verbose else "ERROR"
+    logger.add(sys.stderr, level=level, enqueue=True)
+
+    # Configure logger to work with tqdm
+    class TqdmLoggingHandler:
+        def __init__(self, level=level):
+            self.level = level
+
+        def write(self, message):
+            tqdm.write(message.rstrip())
+
+        def flush(self):
+            pass
+
+    logger.add(TqdmLoggingHandler(), level=level)
 
 @app.command()
 def main(
@@ -94,17 +83,7 @@ def main(
     """
     Converts all HEIC files in a directory (recursively) to JPEG format.
     """
-    global file_search_counter, converted_files_counter
-    file_search_counter = 0
-    converted_files_counter = 0
-
-    # Adjust logging based on verbosity
-    if verbose:
-        logger.remove()
-        logger.add(lambda msg: typer.echo(msg, err=True), level="DEBUG")
-    else:
-        logger.remove()
-        logger.add(lambda msg: None, level="INFO")  # Suppress logs in non-verbose mode
+    setup_logging(verbose)
 
     start_time = time.time()
     logger.info(f"Conversion process started for directory: {directory}")
@@ -124,33 +103,46 @@ def main(
         else:
             jpg_file = os.path.splitext(heic_file)[0] + '.jpg'
 
+        if not overwrite and os.path.exists(jpg_file):
+            continue  # Skip files that don't need conversion
+
         heic_files_to_convert.append((heic_file, jpg_file))
 
-    if not heic_files_to_convert:
+    total_files = len(heic_files_to_convert)
+    if total_files == 0:
         print("All HEIC files have already been converted to JPEG.")
         return
 
-    print("\nStarting conversion...")
+    print(f"Total HEIC files to convert: {total_files}\nStarting conversion...")
+
+    # Use a thread-safe counter
+    success_counter = 0
+    failure_counter = 0
+
+    progress_bar = tqdm(total=total_files, unit="file", ncols=80)
+
+    def task_wrapper(args):
+        heic_file, jpg_file = args
+        result = convert_heic_to_jpg(heic_file, jpg_file, overwrite, delete_original)
+        progress_bar.update(1)
+        return result
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = []
-        for heic_file, jpg_file in heic_files_to_convert:
-            futures.append(executor.submit(
-                convert_heic_to_jpg,
-                heic_file,
-                jpg_file,
-                overwrite=overwrite,
-                delete_original=delete_original
-            ))
+        results = list(executor.map(task_wrapper, heic_files_to_convert))
 
-        # Wait for all futures to complete
-        concurrent.futures.wait(futures)
+    progress_bar.close()
 
-    # Final conversion count display
-    print(f"\nConversion completed. Total files converted: {converted_files_counter}/{file_search_counter}")
+    # Count successes and failures
+    success_counter = sum(results)
+    failure_counter = total_files - success_counter
+
+    print(f"\nConversion completed. Total files converted: {success_counter}/{total_files}")
+    if failure_counter > 0:
+        print(f"Failed conversions: {failure_counter}")
 
     end_time = time.time()
     total_time = end_time - start_time
     logger.info(f"Conversion process completed in {total_time:.2f} seconds.")
 
 if __name__ == "__main__":
-    app()
+    main()
